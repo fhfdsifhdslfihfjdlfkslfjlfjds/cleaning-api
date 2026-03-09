@@ -656,6 +656,20 @@ def update_order_sheet_yellow(order_ws, order_data, new_state):
                 cell.fill = YELLOW_FILL
                 break
 
+def apply_box_border(ws, start_row, end_row, start_col, end_col, thin, medium):
+    for r in range(start_row, end_row + 1):
+        for c in range(start_col, end_col + 1):
+            left_side = medium if c == start_col else thin
+            right_side = medium if c == end_col else thin
+            top_side = medium if r == start_row else thin
+            bottom_side = medium if r == end_row else thin
+
+            ws.cell(r, c).border = Border(
+                left=left_side,
+                right=right_side,
+                top=top_side,
+                bottom=bottom_side
+            )
 
 # =========================
 # 出力シート作成
@@ -674,7 +688,6 @@ def write_cleaning_sheet(wb, sheet_name, assignments, period_label):
     # -------------------------
     thin = Side(style="thin", color="000000")
     medium = Side(style="medium", color="000000")
-    dotted = Side(style="dotted", color="000000")
 
     center = Alignment(horizontal="center", vertical="center")
     left = Alignment(horizontal="left", vertical="center", wrap_text=True)
@@ -757,6 +770,10 @@ def write_cleaning_sheet(wb, sheet_name, assignments, period_label):
     ws["F4"].fill = pink_fill
     ws["F4"].border = Border(left=medium, right=medium, top=medium, bottom=medium)
 
+    apply_box_border(ws, 4, 5, 2, 3, thin, medium)  # B4:C5
+    apply_box_border(ws, 4, 5, 4, 5, thin, medium)  # D4:E5
+    apply_box_border(ws, 4, 5, 6, 7, thin, medium)  # F4:G5
+
     # 見出し
     ws["A6"] = "日付"
     ws["B6"] = "担当者"
@@ -830,15 +847,12 @@ def write_cleaning_sheet(wb, sheet_name, assignments, period_label):
         for col in range(1, 8):
             cell = ws.cell(row=row, column=col)
 
-            # 左右の太線位置
             left_side = medium if col in [1, 2, 4, 6] else thin
             right_side = medium if col in [1, 3, 5, 7] else thin
 
-            # 横罫線は点線
-            top_side = dotted
-            bottom_side = dotted
+            top_side = thin
+            bottom_side = thin
 
-            # 最終行は下太線
             if current == end_date:
                 bottom_side = medium
 
