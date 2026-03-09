@@ -11,12 +11,17 @@ import tempfile
 import os
 import re
 import openpyxl
+import zipfile
+import shutil
+from pathlib import Path
 
 
 app = FastAPI(title="Cleaning Schedule API", version="0.1.0")
 
 DEFAULT_ORDER_SHEET_NAME = "担当者割当順番シート"
 DEFAULT_STATE_SHEET_NAME = "状態管理シート"
+VERSION_SHEET_NAME = "版管理"
+MASTER_ID = "cleaning_master"
 YELLOW_RGB_SET = {"FFFFFF00", "FFFF00", "00FFFF00"}
 YELLOW_FILL = PatternFill(fill_type="solid", fgColor="FFFF00")
 
@@ -850,7 +855,7 @@ def write_cleaning_sheet(wb, sheet_name, assignments, period_label):
 
     last_row = row - 1
 
-        # -------------------------
+    # -------------------------
     # 下部メモ
     # -------------------------
     # 注意書きは横に広く使って見切れ防止
@@ -905,6 +910,90 @@ def write_cleaning_sheet(wb, sheet_name, assignments, period_label):
 
     return ws
 
+def ensure_version_sheet(wb):
+    if VERSION_SHEET_NAME not in wb.sheetnames:
+        ws = wb.create_sheet(VERSION_SHEET_NAME)
+        ws["A1"] = "master_id"
+        ws["B1"] = MASTER_ID
+        ws["A2"] = "version"
+        ws["B2"] = ""
+        ws["A3"] = "previous_version"
+        ws["B3"] = ""
+        ws["A4"] = "generated_at"
+        ws["B4"] = ""
+        ws["A5"] = "status"
+        ws["B5"] = "current"
+    else:
+        ws = wb[VERSION_SHEET_NAME]
+    return ws
+
+
+def validate_or_initialize_version_sheet(wb):
+    """
+    版管理シートがなければ初回作成。
+    あれば status/version を検証。
+    """
+    if VERSION_SHEET_NAME not in wb.sheetnames:
+        ws = ensure_version_sheet(wb)
+        initial_version = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ws["B2"] = initial_version
+        ws["B4"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws["B5"] = "current"
+        return {
+            "master_id": MASTER_ID,
+            "version": initial_version,
+            "previous_version": "",
+            "generated_at": ws["B4"].value,
+            "status": "current",
+            "initialized": True,
+        }
+
+    ws = wb[VERSION_SHEET_NAME]
+
+    master_id = _cell_str(ws["B1"].value)
+    version = _cell_str(ws["B2"].value)
+    previous_version = _cell_str(ws["B3"].value)
+    generated_at = _cell_str(ws["B4"].value)
+    status = _cell_str(ws["B5"].value)
+
+    if master_id != MASTER_ID:
+        raise HTTPException(status_code=400, detail="マスタファイルの master_id が不正です")
+
+    if not version:
+        raise HTTPException(status_code=400, detail="マスタファイルの version が未設定です")
+
+    if status != "current":
+        raise HTTPException(status_code=400, detail="このマスタファイルは最新版ではありません")
+
+    return {
+        "master_id": master_id,
+        "version": version,
+        "previous_version": previous_version,
+        "generated_at": generated_at,
+        "status": status,
+        "initialized": False,
+    }
+
+
+def update_version_info(wb):
+    ws = ensure_version_sheet(wb)
+
+    old_version = _cell_str(ws["B2"].value)
+    new_version = datetime.now().strftime("%Y%m%d_%H%M%S")
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    ws["B3"] = old_version
+    ws["B2"] = new_version
+    ws["B4"] = generated_at
+    ws["B5"] = "current"
+
+    return new_version
+
+def build_output_filenames(shift_sheet_name: str, version: str):
+    cleaning_filename = f"{shift_sheet_name}_掃除当番表.xlsx"
+    master_filename = f"{shift_sheet_name}_更新済みマスタ_{version}.xlsx"
+    zip_filename = f"{shift_sheet_name}_出力一式_{version}.zip"
+    return cleaning_filename, master_filename, zip_filename
 
 # =========================
 # API
@@ -961,6 +1050,10 @@ async def generate_cleaning_schedule(
 
         # マスタファイル読み込み
         master_wb = openpyxl.load_workbook(master_path)
+
+        # 版管理チェック（なければ初回作成）
+        version_info = validate_or_initialize_version_sheet(master_wb)
+
         if order_sheet_name not in master_wb.sheetnames:
             raise HTTPException(
                 status_code=400,
@@ -990,48 +1083,70 @@ async def generate_cleaning_schedule(
             clean_days_normalized
         )
 
-        # 状態管理シート更新（②マスタファイル側）
+        # 状態管理シート更新（マスタ側）
         write_state_sheet(state_ws, new_state)
 
-        # 順番表シートの黄色更新（②マスタファイル側）
+        # 順番表シートの黄色更新（マスタ側）
         update_order_sheet_yellow(order_ws, order_data, new_state)
 
-        # ②マスタファイルは内部保存だけする
-        master_wb.save(master_path)
+        # 版管理更新
+        new_version = update_version_info(master_wb)
 
         # -------------------------
-        # 掃除表だけ別Excelとして新規作成
+        # ファイル名を決定
+        # -------------------------
+        cleaning_filename, master_filename, zip_filename = build_output_filenames(
+            shift_sheet_name,
+            new_version
+        )
+
+        # -------------------------
+        # 1. 更新済みマスタを保存
+        # -------------------------
+        with NamedTemporaryFile(delete=False, suffix=".xlsx") as master_tmp:
+            updated_master_path = master_tmp.name
+
+        master_wb.save(updated_master_path)
+
+        # -------------------------
+        # 2. 掃除当番表だけ別Excelで新規作成
         # -------------------------
         output_wb = Workbook()
-        # デフォルトシート削除
         default_ws = output_wb.active
         output_wb.remove(default_ws)
 
-        period_start = get_start_date_from_sheet_name(shift_sheet_name)
-        next_month_same = period_start + timedelta(days=31)
-        # シート名が 16〜翌月15 前提なので、期間終端は start+30日ではなくシート名から算出済みの実期間を使う
-        # 今回は shift_sheet_name の後半8桁から終端を作る
         m = re.match(r"(\d{8})-(\d{8})", shift_sheet_name)
         if not m:
             raise HTTPException(status_code=400, detail="shift_sheet_name の形式が不正です")
-        end_date = datetime.strptime(m.group(2), "%Y%m%d").date()
 
-        period_label = f"{period_start.year}/{period_start.month}/{period_start.day}〜{end_date.year}/{end_date.month}/{end_date.day}"
+        period_start = datetime.strptime(m.group(1), "%Y%m%d").date()
+        period_end = datetime.strptime(m.group(2), "%Y%m%d").date()
+        period_label = f"{period_start.year}/{period_start.month}/{period_start.day}〜{period_end.year}/{period_end.month}/{period_end.day}"
 
         output_sheet_name = f"掃除当番_{shift_sheet_name}"
         write_cleaning_sheet(output_wb, output_sheet_name, assignments, period_label)
 
-        with NamedTemporaryFile(delete=False, suffix=".xlsx") as out_tmp:
-            output_path = out_tmp.name
+        with NamedTemporaryFile(delete=False, suffix=".xlsx") as cleaning_tmp:
+            cleaning_output_path = cleaning_tmp.name
 
-        output_wb.save(output_path)
+        output_wb.save(cleaning_output_path)
+
+        # -------------------------
+        # 3. ZIP にまとめる
+        # -------------------------
+        with NamedTemporaryFile(delete=False, suffix=".zip") as zip_tmp:
+            zip_output_path = zip_tmp.name
+
+        with zipfile.ZipFile(zip_output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(cleaning_output_path, arcname=cleaning_filename)
+            zf.write(updated_master_path, arcname=master_filename)
 
         return FileResponse(
-            output_path,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=f"{shift_sheet_name}_掃除当番表.xlsx"
+            zip_output_path,
+            media_type="application/zip",
+            filename=zip_filename
         )
-
+    
     except HTTPException:
         raise
     except Exception as e:
