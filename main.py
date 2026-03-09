@@ -995,6 +995,80 @@ def build_output_filenames(shift_sheet_name: str, version: str):
     zip_filename = f"{shift_sheet_name}_出力一式_{version}.zip"
     return cleaning_filename, master_filename, zip_filename
 
+def prepare_cleaning_generation(
+    shift_path: str,
+    master_path: str,
+    shift_sheet_name: str,
+    clean_days: str,
+    order_sheet_name: str,
+    state_sheet_name: str,
+):
+    # シフト表読み込み
+    shift_wb = openpyxl.load_workbook(shift_path)
+    if shift_sheet_name not in shift_wb.sheetnames:
+        raise HTTPException(
+            status_code=400,
+            detail=f"シフト表ファイルに '{shift_sheet_name}' シートが見つかりません"
+        )
+
+    shift_ws = shift_wb[shift_sheet_name]
+    parsed_shift = parse_shift_table_for_cleaning(shift_ws, shift_sheet_name)
+
+    # マスタファイル読み込み
+    master_wb = openpyxl.load_workbook(master_path)
+
+    # 版管理チェック（なければ初回作成）
+    version_info = validate_or_initialize_version_sheet(master_wb)
+
+    if order_sheet_name not in master_wb.sheetnames:
+        raise HTTPException(
+            status_code=400,
+            detail=f"マスタファイルに '{order_sheet_name}' シートが見つかりません"
+        )
+
+    order_ws = master_wb[order_sheet_name]
+    order_data = parse_order_sheet(order_ws)
+
+    state_ws = ensure_state_sheet(master_wb, state_sheet_name, order_data.keys())
+    state_data = read_state_sheet(state_ws, order_data)
+
+    clean_days_normalized = (
+        (clean_days or "")
+        .replace("　", "")
+        .replace(" ", "")
+        .replace("・", "")
+        .strip()
+    )
+    if not clean_days_normalized:
+        clean_days_normalized = "月水金"
+
+    assignments, new_state = assign_cleaning_with_state(
+        parsed_shift,
+        order_data,
+        state_data,
+        clean_days_normalized
+    )
+
+    m = re.match(r"(\d{8})-(\d{8})", shift_sheet_name)
+    if not m:
+        raise HTTPException(status_code=400, detail="shift_sheet_name の形式が不正です")
+
+    period_start = datetime.strptime(m.group(1), "%Y%m%d").date()
+    period_end = datetime.strptime(m.group(2), "%Y%m%d").date()
+    period_label = f"{period_start.year}/{period_start.month}/{period_start.day}〜{period_end.year}/{period_end.month}/{period_end.day}"
+
+    return {
+        "master_wb": master_wb,
+        "order_ws": order_ws,
+        "state_ws": state_ws,
+        "order_data": order_data,
+        "assignments": assignments,
+        "new_state": new_state,
+        "period_label": period_label,
+        "shift_sheet_name": shift_sheet_name,
+        "version_info": version_info,
+    }
+
 # =========================
 # API
 # =========================
@@ -1002,6 +1076,140 @@ def build_output_filenames(shift_sheet_name: str, version: str):
 def health_check():
     return {"status": "ok"}
 
+@app.post("/generate-cleaning-sheet")
+async def generate_cleaning_sheet(
+    shift_file: UploadFile = File(...),
+    master_file: UploadFile = File(...),
+    shift_sheet_name: str = Form(...),
+    clean_days: str = Form("月水金"),
+    order_sheet_name: str = Form(DEFAULT_ORDER_SHEET_NAME),
+    state_sheet_name: str = Form(DEFAULT_STATE_SHEET_NAME),
+):
+    if not shift_sheet_name.strip():
+        raise HTTPException(status_code=400, detail="shift_sheet_name is required")
+
+    shift_filename = shift_file.filename or "shift_file.xlsx"
+    shift_ext = os.path.splitext(shift_filename)[1].lower()
+    if shift_ext not in [".xlsx", ".xlsm", ".xltx", ".xltm"]:
+        raise HTTPException(status_code=400, detail=f"Unsupported shift file type: {shift_ext}")
+
+    master_filename = master_file.filename or "master_file.xlsx"
+    master_ext = os.path.splitext(master_filename)[1].lower()
+    if master_ext not in [".xlsx", ".xlsm", ".xltx", ".xltm"]:
+        raise HTTPException(status_code=400, detail=f"Unsupported master file type: {master_ext}")
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=shift_ext) as tmp_shift:
+            tmp_shift.write(await shift_file.read())
+            shift_path = tmp_shift.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=master_ext) as tmp_master:
+            tmp_master.write(await master_file.read())
+            master_path = tmp_master.name
+
+        prepared = prepare_cleaning_generation(
+            shift_path=shift_path,
+            master_path=master_path,
+            shift_sheet_name=shift_sheet_name,
+            clean_days=clean_days,
+            order_sheet_name=order_sheet_name,
+            state_sheet_name=state_sheet_name,
+        )
+
+        output_wb = Workbook()
+        default_ws = output_wb.active
+        output_wb.remove(default_ws)
+
+        output_sheet_name = f"掃除当番_{prepared['shift_sheet_name']}"
+        write_cleaning_sheet(
+            output_wb,
+            output_sheet_name,
+            prepared["assignments"],
+            prepared["period_label"]
+        )
+
+        with NamedTemporaryFile(delete=False, suffix=".xlsx") as out_tmp:
+            output_path = out_tmp.name
+
+        output_wb.save(output_path)
+
+        return FileResponse(
+            output_path,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=f"{prepared['shift_sheet_name']}_掃除当番表.xlsx"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Excel read error: {e}")
+
+@app.post("/generate-updated-master")
+async def generate_updated_master(
+    shift_file: UploadFile = File(...),
+    master_file: UploadFile = File(...),
+    shift_sheet_name: str = Form(...),
+    clean_days: str = Form("月水金"),
+    order_sheet_name: str = Form(DEFAULT_ORDER_SHEET_NAME),
+    state_sheet_name: str = Form(DEFAULT_STATE_SHEET_NAME),
+):
+    if not shift_sheet_name.strip():
+        raise HTTPException(status_code=400, detail="shift_sheet_name is required")
+
+    shift_filename = shift_file.filename or "shift_file.xlsx"
+    shift_ext = os.path.splitext(shift_filename)[1].lower()
+    if shift_ext not in [".xlsx", ".xlsm", ".xltx", ".xltm"]:
+        raise HTTPException(status_code=400, detail=f"Unsupported shift file type: {shift_ext}")
+
+    master_filename = master_file.filename or "master_file.xlsx"
+    master_ext = os.path.splitext(master_filename)[1].lower()
+    if master_ext not in [".xlsx", ".xlsm", ".xltx", ".xltm"]:
+        raise HTTPException(status_code=400, detail=f"Unsupported master file type: {master_ext}")
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=shift_ext) as tmp_shift:
+            tmp_shift.write(await shift_file.read())
+            shift_path = tmp_shift.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=master_ext) as tmp_master:
+            tmp_master.write(await master_file.read())
+            master_path = tmp_master.name
+
+        prepared = prepare_cleaning_generation(
+            shift_path=shift_path,
+            master_path=master_path,
+            shift_sheet_name=shift_sheet_name,
+            clean_days=clean_days,
+            order_sheet_name=order_sheet_name,
+            state_sheet_name=state_sheet_name,
+        )
+
+        master_wb = prepared["master_wb"]
+        order_ws = prepared["order_ws"]
+        state_ws = prepared["state_ws"]
+        order_data = prepared["order_data"]
+        new_state = prepared["new_state"]
+
+        # マスタ更新
+        write_state_sheet(state_ws, new_state)
+        update_order_sheet_yellow(order_ws, order_data, new_state)
+        new_version = update_version_info(master_wb)
+
+        with NamedTemporaryFile(delete=False, suffix=".xlsx") as master_tmp:
+            updated_master_path = master_tmp.name
+
+        master_wb.save(updated_master_path)
+
+        return FileResponse(
+            updated_master_path,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=f"{prepared['shift_sheet_name']}_更新済みマスタ_{new_version}.xlsx"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Excel read error: {e}")
 
 @app.post("/generate-cleaning-schedule")
 async def generate_cleaning_schedule(
