@@ -547,10 +547,10 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
             "assignments": {}
         }
 
+        
         for place, rt in runtime.items():
-            for place, rt in runtime.items():
-                members = rt["members"]
-                rotated = rotate_list_from_name(members, rt["current_start"])
+            members = rt["members"]
+            rotated = rotate_list_from_name(members, rt["current_start"])
 
 
             # carry と regular を分離
