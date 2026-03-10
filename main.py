@@ -548,8 +548,18 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
         }
 
         for place, rt in runtime.items():
+            for place, rt in runtime.items():
             members = rt["members"]
             rotated = rotate_list_from_name(members, rt["current_start"])
+
+            # DEBUG①
+            if place == "事務所前" and date_str == "2026-03-27":
+                print("DEBUG 事務所前 2026-03-27")
+                print("current_start =", rt["current_start"])
+                print("carry_list =", rt["carry_list"])
+                print("skip_once =", rt["skip_once"])
+                print("used_in_cycle =", rt["used_in_cycle"])
+                print("rotated =", rotated)
 
             # carry と regular を分離
             base_carry = unique_keep_order(rt["carry_list"])
@@ -560,6 +570,12 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
             # -----------------------------
             first_carry = [x for x in base_carry if x not in rt["used_in_cycle"]]
             first_regular = [x for x in base_regular if x not in rt["used_in_cycle"]]
+
+            # DEBUG②
+            if place == "事務所前" and date_str == "2026-03-27":
+                print("三宅 working? ", is_working_on_date(people_map, "三宅", date_str))
+                print("波多野 working? ", is_working_on_date(people_map, "波多野", date_str))
+                print("first_regular =", first_regular)
 
             assigned, assigned_source, carry_after = pick_from_candidates(
                 rt, first_carry, first_regular, date_str
