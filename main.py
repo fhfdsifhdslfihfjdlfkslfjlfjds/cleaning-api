@@ -591,6 +591,8 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
                     carry_after = unique_keep_order(carry_after + carry_after2)
                     started_new_cycle = True
 
+            day_result["assignments"][place] = assigned if assigned else ""
+
 
             # carry 更新
             rt["carry_list"] = unique_keep_order(carry_after)
