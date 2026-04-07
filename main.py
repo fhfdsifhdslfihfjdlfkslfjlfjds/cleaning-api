@@ -505,6 +505,7 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
         for idx, name in enumerate(carry_candidates):
             if name in rt["skip_once"]:
                 rt["skip_once"].remove(name)
+                carry_skipped.append(name)
                 continue
 
             if is_working_on_date(people_map, name, date_str):
@@ -521,6 +522,7 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
         for idx, name in enumerate(regular_candidates):
             if name in rt["skip_once"]:
                 rt["skip_once"].remove(name)
+                regular_skipped.append(name)
                 continue
 
             if is_working_on_date(people_map, name, date_str):
