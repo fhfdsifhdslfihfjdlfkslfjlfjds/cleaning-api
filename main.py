@@ -553,14 +553,18 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
             rotated = rotate_list_from_name(members, rt["current_start"])
 
 
+            # assign_cleaning_with_state 関数内の該当箇所を修正
+
             # carry と regular を分離
             base_carry = unique_keep_order(rt["carry_list"])
             base_regular = [x for x in rotated if x not in base_carry]
 
             # -----------------------------
             # 1回目: この周回で未担当の人だけで探索
+            # ただし carry_list は used_in_cycle フィルタを適用しない
+            # （前周回からの繰越なので、今周回の制限に縛られるべきでない）
             # -----------------------------
-            first_carry = [x for x in base_carry if x not in rt["used_in_cycle"]]
+            first_carry = [x for x in base_carry]  # ← carry は全員候補
             first_regular = [x for x in base_regular if x not in rt["used_in_cycle"]]
 
             assigned, assigned_source, carry_after = pick_from_candidates(
@@ -571,9 +575,10 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
 
             # -----------------------------
             # 2回目: 1回目で決まらなければ、その日の中で次周回へ入る
+            # （carry は1回目で全員試済みなので、ここでは regular のみ）
             # -----------------------------
             if not assigned:
-                second_carry = [x for x in base_carry if x in rt["used_in_cycle"]]
+                second_carry = []  # ← carry は1回目で全探索済み
                 second_regular = [x for x in base_regular if x in rt["used_in_cycle"]]
 
                 assigned2, assigned_source2, carry_after2 = pick_from_candidates(
@@ -586,7 +591,6 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
                     carry_after = unique_keep_order(carry_after + carry_after2)
                     started_new_cycle = True
 
-            day_result["assignments"][place] = assigned if assigned else ""
 
             # carry 更新
             rt["carry_list"] = unique_keep_order(carry_after)
