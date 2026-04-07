@@ -341,6 +341,8 @@ def ensure_state_sheet(wb, sheet_name: str, place_names):
         ws["F1"] = "スキップリスト"
         ws["G1"] = "更新日時"
         ws["H1"] = "メモ"
+        ws["I1"] = "通常順次位置"
+        ws["J1"] = "周回担当済み"
 
         row = 2
         for place in place_names:
@@ -348,6 +350,11 @@ def ensure_state_sheet(wb, sheet_name: str, place_names):
             row += 1
     else:
         ws = wb[sheet_name]
+        # 既存シートにI,J列がなければヘッダー追加
+        if not _cell_str(ws.cell(1, 9).value):
+            ws.cell(1, 9, value="通常順次位置")
+        if not _cell_str(ws.cell(1, 10).value):
+            ws.cell(1, 10, value="周回担当済み")
 
     existing_places = set()
     for row in range(2, ws.max_row + 1):
@@ -364,10 +371,8 @@ def ensure_state_sheet(wb, sheet_name: str, place_names):
     return ws
 
 
+
 def read_state_sheet(ws, order_data):
-    """
-    空欄なら順番表シートの黄色セルを初期開始位置として使う
-    """
     state = {}
 
     for row in range(2, ws.max_row + 1):
@@ -380,6 +385,8 @@ def read_state_sheet(ws, order_data):
         prev_assigned_list = parse_pipe_list(ws.cell(row, 4).value)
         prev_assigned_date = _cell_str(ws.cell(row, 5).value)
         skip_list = parse_pipe_list(ws.cell(row, 6).value)
+        current_start_regular = _cell_str(ws.cell(row, 9).value)
+        used_in_cycle = parse_pipe_list(ws.cell(row, 10).value)
 
         if not next_start and place in order_data:
             next_start = order_data[place]["start_from"]
@@ -391,6 +398,8 @@ def read_state_sheet(ws, order_data):
             "prev_assigned_list": prev_assigned_list,
             "prev_assigned_date": prev_assigned_date,
             "skip_list": skip_list,
+            "current_start_regular": current_start_regular,
+            "used_in_cycle": used_in_cycle,
         }
 
     for place, info in order_data.items():
@@ -402,9 +411,12 @@ def read_state_sheet(ws, order_data):
                 "prev_assigned_list": [],
                 "prev_assigned_date": "",
                 "skip_list": [],
+                "current_start_regular": "",
+                "used_in_cycle": [],
             }
 
     return state
+
 
 
 def write_state_sheet(ws, state):
@@ -430,6 +442,9 @@ def write_state_sheet(ws, state):
         ws.cell(row=row, column=5, value=info.get("prev_assigned_date", ""))
         ws.cell(row=row, column=6, value=join_pipe_list(info.get("skip_list", [])))
         ws.cell(row=row, column=7, value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        ws.cell(row=row, column=9, value=info.get("current_start_regular", ""))
+        ws.cell(row=row, column=10, value=join_pipe_list(info.get("used_in_cycle", [])))
+
 
 
 # =========================
@@ -457,15 +472,6 @@ def is_working_on_date(people_map, name, date_str):
 
 
 def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_normalized):
-    """
-    - 場所ごと独立
-    - carry_list を先頭優先
-    - skip_list は次回1回だけ飛ばす
-    - 同じ日に同じ人が複数場所担当でもOK
-    - 同じ周回で一度担当した人は再登場しない
-    - ただし、その周回の未担当者が全員休みなら、その日の中で次周回へ入る
-    - carry から担当が出ても、carry の後ろに残る人は保持する
-    """
     target_weekdays = set(clean_days_normalized)
 
     people_map = {}
@@ -481,27 +487,27 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
     runtime = {}
     for place, order_info in order_data.items():
         st = state_data.get(place, {})
+
+        # current_start: I列(通常順次位置)を優先、なければB列(次回先頭)
+        current_start = (
+            st.get("current_start_regular")
+            or st.get("next_start")
+            or order_info["start_from"]
+        )
+
         runtime[place] = {
             "members": order_info["members"][:],
-            "current_start": st.get("next_start") or order_info["start_from"],
+            "current_start": current_start,
             "carry_list": st.get("carry_list", [])[:],
             "skip_once": st.get("skip_list", [])[:],
             "assigned_history": [],
             "last_assigned_date": "",
-            "used_in_cycle": set(),
+            "used_in_cycle": set(st.get("used_in_cycle", [])),
         }
 
     def pick_from_candidates(rt, carry_candidates, regular_candidates, date_str):
-        """
-        carry → regular の順で探索
-        戻り値:
-        - assigned
-        - assigned_source ("carry" / "regular" / None)
-        - carry_after （次回へ残す carry）
-        """
         carry_skipped = []
 
-        # 1) carry を探索
         for idx, name in enumerate(carry_candidates):
             if name in rt["skip_once"]:
                 rt["skip_once"].remove(name)
@@ -509,31 +515,27 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
                 continue
 
             if is_working_on_date(people_map, name, date_str):
-                # carry から担当が出た場合、
-                # 後ろに残っている carry は次回へ残す
                 remaining_carry = carry_candidates[idx + 1:]
                 carry_after = unique_keep_order(carry_skipped + remaining_carry)
                 return name, "carry", carry_after
             else:
                 carry_skipped.append(name)
 
-        # 2) regular を探索
         regular_skipped = []
         for idx, name in enumerate(regular_candidates):
             if name in rt["skip_once"]:
                 rt["skip_once"].remove(name)
-                regular_skipped.append(name)
+                # 今の周回で未担当ならcarryに入れる、担当済みなら入れない
+                if name not in rt["used_in_cycle"]:
+                    regular_skipped.append(name)
                 continue
 
             if is_working_on_date(people_map, name, date_str):
-                # regular から担当が出た場合、
-                # それまで休みで飛ばした regular は carry に入れる
                 carry_after = unique_keep_order(carry_skipped + regular_skipped)
                 return name, "regular", carry_after
             else:
                 regular_skipped.append(name)
 
-        # 誰も担当できなかった
         carry_after = unique_keep_order(carry_skipped + regular_skipped)
         return None, None, carry_after
 
@@ -549,24 +551,14 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
             "assignments": {}
         }
 
-        
         for place, rt in runtime.items():
             members = rt["members"]
             rotated = rotate_list_from_name(members, rt["current_start"])
 
-
-            # assign_cleaning_with_state 関数内の該当箇所を修正
-
-            # carry と regular を分離
             base_carry = unique_keep_order(rt["carry_list"])
             base_regular = [x for x in rotated if x not in base_carry]
 
-            # -----------------------------
-            # 1回目: この周回で未担当の人だけで探索
-            # ただし carry_list は used_in_cycle フィルタを適用しない
-            # （前周回からの繰越なので、今周回の制限に縛られるべきでない）
-            # -----------------------------
-            first_carry = [x for x in base_carry]  # ← carry は全員候補
+            first_carry = [x for x in base_carry]
             first_regular = [x for x in base_regular if x not in rt["used_in_cycle"]]
 
             assigned, assigned_source, carry_after = pick_from_candidates(
@@ -575,12 +567,8 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
 
             started_new_cycle = False
 
-            # -----------------------------
-            # 2回目: 1回目で決まらなければ、その日の中で次周回へ入る
-            # （carry は1回目で全員試済みなので、ここでは regular のみ）
-            # -----------------------------
             if not assigned:
-                second_carry = []  # ← carry は1回目で全探索済み
+                second_carry = []
                 second_regular = [x for x in base_regular if x in rt["used_in_cycle"]]
 
                 assigned2, assigned_source2, carry_after2 = pick_from_candidates(
@@ -595,22 +583,18 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
 
             day_result["assignments"][place] = assigned if assigned else ""
 
-
-            # carry 更新
             rt["carry_list"] = unique_keep_order(carry_after)
 
             if assigned:
                 rt["assigned_history"].append(assigned)
                 rt["last_assigned_date"] = date_str
 
-                # 新しい周回に入ったなら used をリセットして今回担当だけ入れる
                 if started_new_cycle:
                     rt["used_in_cycle"] = {assigned}
+                    rt["skip_once"] = []  # ← この1行を追加
                 else:
                     rt["used_in_cycle"].add(assigned)
 
-                # 通常順から選ばれたときだけ current_start を進める
-                # carry から復帰した人では current_start を動かさない
                 if assigned_source == "regular":
                     idx = members.index(assigned)
                     next_idx = (idx + 1) % len(members)
@@ -620,24 +604,22 @@ def assign_cleaning_with_state(parsed_shift, order_data, state_data, clean_days_
 
     new_state = {}
     for place, rt in runtime.items():
-        if rt["carry_list"]:
-            next_start = rt["carry_list"][0]
-        else:
-            next_start = rt["current_start"]
-
         assigned_history = rt.get("assigned_history", [])
         last_person = str(assigned_history[-1]) if assigned_history else ""
         prev_list = [last_person] if last_person else []
 
         new_state[place] = {
-            "next_start": next_start,
+            "next_start": rt["current_start"],
             "carry_list": rt["carry_list"],
             "prev_assigned_list": prev_list,
             "prev_assigned_date": rt["last_assigned_date"],
-            "skip_list": prev_list
+            "skip_list": prev_list,
+            "current_start_regular": rt["current_start"],
+            "used_in_cycle": list(rt["used_in_cycle"]),
         }
 
     return results, new_state
+
 
 
 # =========================
